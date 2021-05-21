@@ -1,6 +1,6 @@
 #region License
 /* FNA - XNA4 Reimplementation for Desktop Platforms
- * Copyright 2009-2020 Ethan Lee and the MonoGame Team
+ * Copyright 2009-2021 Ethan Lee and the MonoGame Team
  *
  * Released under the Microsoft Public License.
  * See LICENSE for details.
@@ -40,11 +40,6 @@ namespace Microsoft.Xna.Framework
 		private static int RetinaWidth;
 		private static int RetinaHeight;
 
-		private static readonly bool OSXUseSpaces = (
-			SDL.SDL_GetPlatform().Equals("Mac OS X") && // Prevents race with OSVersion
-			SDL.SDL_GetHintBoolean(SDL.SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, SDL.SDL_bool.SDL_TRUE) == SDL.SDL_bool.SDL_TRUE
-		);
-
 		#endregion
 
 		#region Game Objects
@@ -63,12 +58,22 @@ namespace Microsoft.Xna.Framework
 			{
 				OSVersion = SDL.SDL_GetPlatform();
 			}
-			catch(Exception e)
+			catch(DllNotFoundException e)
 			{
 				FNALoggerEXT.LogError(
 					"SDL2 was not found! Do you have fnalibs?"
 				);
 				throw e;
+			}
+			catch(BadImageFormatException e)
+			{
+				string error = string.Format(
+					"This process is {0}-bit, the DLL is {1}-bit!",
+					(IntPtr.Size == 4) ? "32" : "64",
+					(IntPtr.Size == 4) ? "64" : "32"
+				);
+				FNALoggerEXT.LogError(error);
+				throw new BadImageFormatException(error, e);
 			}
 
 			/* SDL2 might complain if an OS that uses SDL_main has not actually
@@ -78,24 +83,6 @@ namespace Microsoft.Xna.Framework
 			 * -flibit
 			 */
 			SDL.SDL_SetMainReady();
-
-			/* A number of platforms don't support global mouse, but
-			 * this really only matters on desktop where the game
-			 * screen may not be covering the whole display.
-			 */
-			if (	OSVersion.Equals("Windows") ||
-				OSVersion.Equals("Mac OS X") ||
-				OSVersion.Equals("Linux") ||
-				OSVersion.Equals("FreeBSD") ||
-				OSVersion.Equals("OpenBSD") ||
-				OSVersion.Equals("NetBSD")	)
-			{
-				SupportsGlobalMouse = true;
-			}
-			else
-			{
-				SupportsGlobalMouse = false;
-			}
 
 			// Also, Windows is an idiot. -flibit
 			if (	OSVersion.Equals("Windows") ||
@@ -114,9 +101,14 @@ namespace Microsoft.Xna.Framework
 				 * WM_PAINT events correctly. So we get to do this!
 				 * -flibit
 				 */
+				IntPtr prevUserData;
+				SDL.SDL_GetEventFilter(
+					out prevEventFilter,
+					out prevUserData
+				);
 				SDL.SDL_SetEventFilter(
 					win32OnPaint,
-					IntPtr.Zero
+					prevUserData
 				);
 			}
 
@@ -172,6 +164,13 @@ namespace Microsoft.Xna.Framework
 					"1"
 				);
 			}
+			if (args.TryGetValue("forcemailboxvsync", out arg) && arg == "1")
+			{
+				Environment.SetEnvironmentVariable(
+					"FNA3D_VULKAN_FORCE_MAILBOX_VSYNC",
+					"1"
+				);
+			}
 
 			// This _should_ be the first real SDL call we make...
 			SDL.SDL_Init(
@@ -180,6 +179,21 @@ namespace Microsoft.Xna.Framework
 				SDL.SDL_INIT_GAMECONTROLLER |
 				SDL.SDL_INIT_HAPTIC
 			);
+
+			/* A number of platforms don't support global mouse, but
+			 * this really only matters on desktop where the game
+			 * screen may not be covering the whole display.
+			 */
+			if (	OSVersion.Equals("Windows") ||
+				OSVersion.Equals("Mac OS X") ||
+				SDL.SDL_GetCurrentVideoDriver() == "x11"	)
+			{
+				SupportsGlobalMouse = true;
+			}
+			else
+			{
+				SupportsGlobalMouse = false;
+			}
 
 			// Set any hints to match XNA4 behavior...
 			string hint = SDL.SDL_GetHint(SDL.SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS);
@@ -191,15 +205,19 @@ namespace Microsoft.Xna.Framework
 				);
 			}
 
-			// By default, assume physical layout, since XNA games probably assume XInput
-			hint = SDL.SDL_GetHint(SDL.SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS);
-			if (String.IsNullOrEmpty(hint))
-			{
-				SDL.SDL_SetHint(
-					SDL.SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS,
-					"0"
-				);
-			}
+			/* By default, assume physical layout, since XNA games mostly assume XInput.
+			 * This used to be more flexible until Steam decided to enforce the variable
+			 * that already had their desired value as the default (big surprise).
+			 *
+			 * TL;DR: Suck my ass, Steam
+			 *
+			 * -flibit
+			 */
+			SDL.SDL_SetHintWithPriority(
+				SDL.SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS,
+				"0",
+				SDL.SDL_HintPriority.SDL_HINT_OVERRIDE
+			);
 
 			SDL.SDL_SetHint(
 				SDL.SDL_HINT_ORIENTATIONS,
@@ -248,6 +266,50 @@ namespace Microsoft.Xna.Framework
 				SDL.SDL_WindowFlags.SDL_WINDOW_INPUT_FOCUS |
 				SDL.SDL_WindowFlags.SDL_WINDOW_MOUSE_FOCUS
 			) | (SDL.SDL_WindowFlags) FNA3D.FNA3D_PrepareWindowAttributes();
+
+			if ((initFlags & SDL.SDL_WindowFlags.SDL_WINDOW_VULKAN) == SDL.SDL_WindowFlags.SDL_WINDOW_VULKAN)
+			{
+				string cachePath = SDL.SDL_GetHint(
+					"FNA3D_VULKAN_PIPELINE_CACHE_FILE_NAME"
+				);
+				if (cachePath == null) // Empty is a valid value
+				{
+					if (	OSVersion.Equals("Windows") ||
+						OSVersion.Equals("Mac OS X") ||
+						OSVersion.Equals("Linux") ||
+						OSVersion.Equals("FreeBSD") ||
+						OSVersion.Equals("OpenBSD") ||
+						OSVersion.Equals("NetBSD")	)
+					{
+#if DEBUG // Save pipeline cache files to the base directory for debug builds
+						cachePath = "FNA3D_Vulkan_PipelineCache.blob";
+#else
+						string exeName = Path.GetFileNameWithoutExtension(
+							AppDomain.CurrentDomain.FriendlyName
+						).Replace(".vshost", "");
+						cachePath = Path.Combine(
+							SDL.SDL_GetPrefPath(null, "FNA3D"),
+							exeName + "_Vulkan_PipelineCache.blob"
+						);
+#endif
+					}
+					else
+					{
+						/* For all non-desktop targets, disable
+						 * the pipeline cache. There is usually
+						 * some specialized path you have to
+						 * take to use pipeline cache files, so
+						 * developers will have to do things the
+						 * hard way over there.
+						 */
+						cachePath = string.Empty;
+					}
+					SDL.SDL_SetHint(
+						"FNA3D_VULKAN_PIPELINE_CACHE_FILE_NAME",
+						cachePath
+					);
+				}
+			}
 
 			if (Environment.GetEnvironmentVariable("FNA_GRAPHICS_ENABLE_HIGHDPI") == "1")
 			{
@@ -342,8 +404,7 @@ namespace Microsoft.Xna.Framework
 			ref string resultDeviceName
 		) {
 			bool center = false;
-			if (	Environment.GetEnvironmentVariable("FNA_GRAPHICS_ENABLE_HIGHDPI") == "1" &&
-				OSVersion.Equals("Mac OS X")	)
+			if (Environment.GetEnvironmentVariable("FNA_GRAPHICS_ENABLE_HIGHDPI") == "1")
 			{
 				/* For high-DPI windows, halve the size!
 				 * The drawable size is now the primary width/height, so
@@ -375,6 +436,7 @@ namespace Microsoft.Xna.Framework
 				}
 				if (resize)
 				{
+					SDL.SDL_RestoreWindow(window);
 					SDL.SDL_SetWindowSize(window, clientWidth, clientHeight);
 					center = true;
 				}
@@ -826,7 +888,7 @@ namespace Microsoft.Xna.Framework
 					{
 						game.IsActive = true;
 
-						if (!OSXUseSpaces)
+						if (SDL.SDL_GetCurrentVideoDriver() == "x11")
 						{
 							// If we alt-tab away, we lose the 'fullscreen desktop' flag on some WMs
 							SDL.SDL_SetWindowFullscreen(
@@ -844,7 +906,7 @@ namespace Microsoft.Xna.Framework
 					{
 						game.IsActive = false;
 
-						if (!OSXUseSpaces)
+						if (SDL.SDL_GetCurrentVideoDriver() == "x11")
 						{
 							SDL.SDL_SetWindowFullscreen(game.Window.Handle, 0);
 						}
@@ -867,7 +929,9 @@ namespace Microsoft.Xna.Framework
 						 * Also ignore any other "resizes" (alt-tab, fullscreen, etc.)
 						 * -flibit
 						 */
-						if (GetWindowResizable(game.Window.Handle))
+						uint flags = SDL.SDL_GetWindowFlags(game.Window.Handle);
+						if (	(flags & (uint) SDL.SDL_WindowFlags.SDL_WINDOW_RESIZABLE) != 0 &&
+							(flags & (uint) SDL.SDL_WindowFlags.SDL_WINDOW_INPUT_FOCUS) != 0	)
 						{
 							((FNAWindow) game.Window).INTERNAL_ClientSizeChanged();
 						}
@@ -912,6 +976,13 @@ namespace Microsoft.Xna.Framework
 				// Display Events
 				else if (evt.type == SDL.SDL_EventType.SDL_DISPLAYEVENT)
 				{
+					GraphicsAdapter.AdaptersChanged();
+
+					int displayIndex = SDL.SDL_GetWindowDisplayIndex(
+						game.Window.Handle
+					);
+					currentAdapter = GraphicsAdapter.Adapters[displayIndex];
+
 					// Orientation Change
 					if (evt.display.displayEvent == SDL.SDL_DisplayEventID.SDL_DISPLAYEVENT_ORIENTATION)
 					{
@@ -943,16 +1014,9 @@ namespace Microsoft.Xna.Framework
 					// Based on the SDL2# LPUtf8StrMarshaler
 					unsafe
 					{
-						byte* endPtr = evt.text.text;
-						if (*endPtr != 0)
+						int bytes = MeasureStringLength(evt.text.text);
+						if (bytes > 0) 
 						{
-							int bytes = 0;
-							while (*endPtr != 0)
-							{
-								endPtr++;
-								bytes += 1;
-							}
-
 							/* UTF8 will never encode more characters
 							 * than bytes in a string, so bytes is a
 							 * suitable upper estimate of size needed
@@ -973,6 +1037,30 @@ namespace Microsoft.Xna.Framework
 					}
 				}
 
+				else if (evt.type == SDL.SDL_EventType.SDL_TEXTEDITING) 
+				{
+					unsafe 
+					{
+						int bytes = MeasureStringLength(evt.edit.text);
+						if (bytes > 0) 
+						{
+							char* charsBuffer = stackalloc char[bytes];
+							int chars = Encoding.UTF8.GetChars(
+								evt.edit.text,
+								bytes,
+								charsBuffer,
+								bytes
+							);
+							string text = new string(charsBuffer, 0, chars);
+							TextInputEXT.OnTextEditing(text, evt.edit.start, evt.edit.length);
+						} 
+						else 
+						{
+							TextInputEXT.OnTextEditing(null, 0, 0);
+						}
+					}
+				}
+
 				// Quit
 				else if (evt.type == SDL.SDL_EventType.SDL_QUIT)
 				{
@@ -988,6 +1076,13 @@ namespace Microsoft.Xna.Framework
 					TextInputEXT.OnTextInput(FNAPlatform.TextInputCharacters[i]);
 				}
 			}
+		}
+
+		private unsafe static int MeasureStringLength(byte* ptr)
+		{
+			int bytes;
+			for (bytes = 0; *ptr != 0; ptr += 1, bytes += 1);
+			return bytes;
 		}
 
 		public static bool NeedsPlatformMainLoop()
@@ -1021,14 +1116,14 @@ namespace Microsoft.Xna.Framework
 		private static Game emscriptenGame;
 		private delegate void em_callback_func();
 
-		[DllImport("emscripten", CallingConvention = CallingConvention.Cdecl)]
+		[DllImport("__Native", CallingConvention = CallingConvention.Cdecl)]
 		private static extern void emscripten_set_main_loop(
 			em_callback_func func,
 			int fps,
 			int simulate_infinite_loop
 		);
 
-		[DllImport("emscripten", CallingConvention = CallingConvention.Cdecl)]
+		[DllImport("__Native", CallingConvention = CallingConvention.Cdecl)]
 		private static extern void emscripten_cancel_main_loop();
 
 		[ObjCRuntime.MonoPInvokeCallback(typeof(em_callback_func))]
@@ -1363,6 +1458,16 @@ namespace Microsoft.Xna.Framework
 			return Path.GetPathRoot(storageRoot);
 		}
 
+		public static IntPtr ReadToPointer(string path, out IntPtr size)
+		{
+			return SDL.SDL_LoadFile(path, out size);
+		}
+
+		public static void FreeFilePointer(IntPtr file)
+		{
+			SDL.SDL_free(file);
+		}
+
 		#endregion
 
 		#region Logging/Messaging Methods
@@ -1482,9 +1587,6 @@ namespace Microsoft.Xna.Framework
 		private static Dictionary<int, int> INTERNAL_instanceList = new Dictionary<int, int>();
 		private static string[] INTERNAL_guids = GenStringArray();
 
-		// Light bar information
-		private static string[] INTERNAL_lightBars = GenStringArray();
-
 		// Cached GamePadStates/Capabilities
 		private static GamePadState[] INTERNAL_states = new GamePadState[GamePad.GAMEPAD_COUNT];
 		private static GamePadCapabilities[] INTERNAL_capabilities = new GamePadCapabilities[GamePad.GAMEPAD_COUNT];
@@ -1519,9 +1621,6 @@ namespace Microsoft.Xna.Framework
 				return new GamePadState();
 			}
 
-			// The "master" button state is built from this.
-			Buttons gc_buttonState = (Buttons) 0;
-
 			// Sticks
 			Vector2 stickLeft = new Vector2(
 				(float) SDL.SDL_GameControllerGetAxis(
@@ -1543,22 +1642,6 @@ namespace Microsoft.Xna.Framework
 					SDL.SDL_GameControllerAxis.SDL_CONTROLLER_AXIS_RIGHTY
 				) / -32767.0f
 			);
-			gc_buttonState |= READ_StickToButtons(
-				stickLeft,
-				Buttons.LeftThumbstickLeft,
-				Buttons.LeftThumbstickRight,
-				Buttons.LeftThumbstickUp,
-				Buttons.LeftThumbstickDown,
-				GamePad.LeftDeadZone
-			);
-			gc_buttonState |= READ_StickToButtons(
-				stickRight,
-				Buttons.RightThumbstickLeft,
-				Buttons.RightThumbstickRight,
-				Buttons.RightThumbstickUp,
-				Buttons.RightThumbstickDown,
-				GamePad.RightDeadZone
-			);
 
 			// Triggers
 			float triggerLeft = (float) SDL.SDL_GameControllerGetAxis(
@@ -1569,16 +1652,9 @@ namespace Microsoft.Xna.Framework
 				device,
 				SDL.SDL_GameControllerAxis.SDL_CONTROLLER_AXIS_TRIGGERRIGHT
 			) / 32767.0f;
-			if (triggerLeft > GamePad.TriggerThreshold)
-			{
-				gc_buttonState |= Buttons.LeftTrigger;
-			}
-			if (triggerRight > GamePad.TriggerThreshold)
-			{
-				gc_buttonState |= Buttons.RightTrigger;
-			}
 
 			// Buttons
+			Buttons gc_buttonState = (Buttons) 0;
 			if (SDL.SDL_GameControllerGetButton(device, SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_A) != 0)
 			{
 				gc_buttonState |= Buttons.A;
@@ -1650,6 +1726,32 @@ namespace Microsoft.Xna.Framework
 				dpadRight = ButtonState.Pressed;
 			}
 
+			// Extensions
+			if (SDL.SDL_GameControllerGetButton(device, SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_MISC1) != 0)
+			{
+				gc_buttonState |= Buttons.Misc1EXT;
+			}
+			if (SDL.SDL_GameControllerGetButton(device, SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_PADDLE1) != 0)
+			{
+				gc_buttonState |= Buttons.Paddle1EXT;
+			}
+			if (SDL.SDL_GameControllerGetButton(device, SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_PADDLE2) != 0)
+			{
+				gc_buttonState |= Buttons.Paddle2EXT;
+			}
+			if (SDL.SDL_GameControllerGetButton(device, SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_PADDLE3) != 0)
+			{
+				gc_buttonState |= Buttons.Paddle3EXT;
+			}
+			if (SDL.SDL_GameControllerGetButton(device, SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_PADDLE4) != 0)
+			{
+				gc_buttonState |= Buttons.Paddle4EXT;
+			}
+			if (SDL.SDL_GameControllerGetButton(device, SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_TOUCHPAD) != 0)
+			{
+				gc_buttonState |= Buttons.TouchPadEXT;
+			}
+
 			// Build the GamePadState, increment PacketNumber if state changed.
 			GamePadState gc_builtState = new GamePadState(
 				new GamePadThumbSticks(stickLeft, stickRight, deadZoneMode),
@@ -1684,6 +1786,22 @@ namespace Microsoft.Xna.Framework
 			) == 0;
 		}
 
+		public static bool SetGamePadTriggerVibration(int index, float leftTrigger, float rightTrigger)
+		{
+			IntPtr device = INTERNAL_devices[index];
+			if (device == IntPtr.Zero)
+			{
+				return false;
+			}
+
+			return SDL.SDL_GameControllerRumbleTriggers(
+				device,
+				(ushort) (MathHelper.Clamp(leftTrigger, 0.0f, 1.0f) * 0xFFFF),
+				(ushort) (MathHelper.Clamp(rightTrigger, 0.0f, 1.0f) * 0xFFFF),
+				0
+			) == 0;
+		}
+
 		public static string GetGamePadGUID(int index)
 		{
 			return INTERNAL_guids[index];
@@ -1691,22 +1809,95 @@ namespace Microsoft.Xna.Framework
 
 		public static void SetGamePadLightBar(int index, Color color)
 		{
-			if (String.IsNullOrEmpty(INTERNAL_lightBars[index]))
+			IntPtr device = INTERNAL_devices[index];
+			if (device == IntPtr.Zero)
 			{
 				return;
 			}
 
-			string baseDir = INTERNAL_lightBars[index];
-			try
+			SDL.SDL_GameControllerSetLED(
+				device,
+				color.R,
+				color.G,
+				color.B
+			);
+		}
+
+		public static bool GetGamePadGyro(int index, out Vector3 gyro)
+		{
+			IntPtr device = INTERNAL_devices[index];
+			if (device == IntPtr.Zero)
 			{
-				File.WriteAllText(baseDir + "red/brightness", color.R.ToString());
-				File.WriteAllText(baseDir + "green/brightness", color.G.ToString());
-				File.WriteAllText(baseDir + "blue/brightness", color.B.ToString());
+				gyro = Vector3.Zero;
+				return false;
 			}
-			catch
+
+			if (SDL.SDL_GameControllerIsSensorEnabled(
+				device,
+				SDL.SDL_SensorType.SDL_SENSOR_GYRO
+			) == SDL.SDL_bool.SDL_FALSE) {
+				SDL.SDL_GameControllerSetSensorEnabled(
+					device,
+					SDL.SDL_SensorType.SDL_SENSOR_GYRO,
+					SDL.SDL_bool.SDL_TRUE
+				);
+			}
+
+			unsafe
 			{
-				// If something went wrong, assume the worst and just remove it.
-				INTERNAL_lightBars[index] = String.Empty;
+				float* data = stackalloc float[3];
+				if (SDL.SDL_GameControllerGetSensorData(
+					device,
+					SDL.SDL_SensorType.SDL_SENSOR_GYRO,
+					(IntPtr) data,
+					3
+				) < 0) {
+					gyro = Vector3.Zero;
+					return false;
+				}
+				gyro.X = data[0];
+				gyro.Y = data[1];
+				gyro.Z = data[2];
+				return true;
+			}
+		}
+
+		public static bool GetGamePadAccelerometer(int index, out Vector3 accel)
+		{
+			IntPtr device = INTERNAL_devices[index];
+			if (device == IntPtr.Zero)
+			{
+				accel = Vector3.Zero;
+				return false;
+			}
+
+			if (SDL.SDL_GameControllerIsSensorEnabled(
+				device,
+				SDL.SDL_SensorType.SDL_SENSOR_ACCEL
+			) == SDL.SDL_bool.SDL_FALSE) {
+				SDL.SDL_GameControllerSetSensorEnabled(
+					device,
+					SDL.SDL_SensorType.SDL_SENSOR_ACCEL,
+					SDL.SDL_bool.SDL_TRUE
+				);
+			}
+
+			unsafe
+			{
+				float* data = stackalloc float[3];
+				if (SDL.SDL_GameControllerGetSensorData(
+					device,
+					SDL.SDL_SensorType.SDL_SENSOR_ACCEL,
+					(IntPtr) data,
+					3
+				) < 0) {
+					accel = Vector3.Zero;
+					return false;
+				}
+				accel.X = data[0];
+				accel.Y = data[1];
+				accel.Z = data[2];
+				return true;
 			}
 		}
 
@@ -1752,6 +1943,12 @@ namespace Microsoft.Xna.Framework
 
 			// Initialize the haptics for the joystick, if applicable.
 			bool hasRumble = SDL.SDL_GameControllerRumble(
+				INTERNAL_devices[which],
+				0,
+				0,
+				0
+			) == 0;
+			bool hasTriggerRumble = SDL.SDL_GameControllerRumbleTriggers(
 				INTERNAL_devices[which],
 				0,
 				0,
@@ -1849,6 +2046,42 @@ namespace Microsoft.Xna.Framework
 			caps.HasLeftVibrationMotor = hasRumble;
 			caps.HasRightVibrationMotor = hasRumble;
 			caps.HasVoiceSupport = false;
+			caps.HasLightBarEXT = SDL.SDL_GameControllerHasLED(
+				INTERNAL_devices[which]
+			) == SDL.SDL_bool.SDL_TRUE;
+			caps.HasTriggerVibrationMotorsEXT = hasTriggerRumble;
+			caps.HasMisc1EXT = SDL.SDL_GameControllerGetBindForButton(
+				INTERNAL_devices[which],
+				SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_MISC1
+			).bindType != SDL.SDL_GameControllerBindType.SDL_CONTROLLER_BINDTYPE_NONE;
+			caps.HasPaddle1EXT = SDL.SDL_GameControllerGetBindForButton(
+				INTERNAL_devices[which],
+				SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_PADDLE1
+			).bindType != SDL.SDL_GameControllerBindType.SDL_CONTROLLER_BINDTYPE_NONE;
+			caps.HasPaddle2EXT = SDL.SDL_GameControllerGetBindForButton(
+				INTERNAL_devices[which],
+				SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_PADDLE2
+			).bindType != SDL.SDL_GameControllerBindType.SDL_CONTROLLER_BINDTYPE_NONE;
+			caps.HasPaddle3EXT = SDL.SDL_GameControllerGetBindForButton(
+				INTERNAL_devices[which],
+				SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_PADDLE3
+			).bindType != SDL.SDL_GameControllerBindType.SDL_CONTROLLER_BINDTYPE_NONE;
+			caps.HasPaddle4EXT = SDL.SDL_GameControllerGetBindForButton(
+				INTERNAL_devices[which],
+				SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_PADDLE4
+			).bindType != SDL.SDL_GameControllerBindType.SDL_CONTROLLER_BINDTYPE_NONE;
+			caps.HasTouchPadEXT = SDL.SDL_GameControllerGetBindForButton(
+				INTERNAL_devices[which],
+				SDL.SDL_GameControllerButton.SDL_CONTROLLER_BUTTON_TOUCHPAD
+			).bindType != SDL.SDL_GameControllerBindType.SDL_CONTROLLER_BINDTYPE_NONE;
+			caps.HasGyroEXT = SDL.SDL_GameControllerHasSensor(
+				INTERNAL_devices[which],
+				SDL.SDL_SensorType.SDL_SENSOR_GYRO
+			) == SDL.SDL_bool.SDL_TRUE;
+			caps.HasAccelerometerEXT = SDL.SDL_GameControllerHasSensor(
+				INTERNAL_devices[which],
+				SDL.SDL_SensorType.SDL_SENSOR_ACCEL
+			) == SDL.SDL_bool.SDL_TRUE;
 			INTERNAL_capabilities[which] = caps;
 
 			/* Store the GUID string for this device
@@ -1869,39 +2102,6 @@ namespace Microsoft.Xna.Framework
 					product & 0xFF,
 					product >> 8
 				);
-			}
-
-			// Initialize light bar
-			if (	OSVersion.Equals("Linux") &&
-				(	INTERNAL_guids[which].Equals("4c05c405") ||
-					INTERNAL_guids[which].Equals("4c05cc09")	)	)
-			{
-				// Get all of the individual PS4 LED instances
-				List<string> ledList = new List<string>();
-				string[] dirs = Directory.GetDirectories("/sys/class/leds/");
-				foreach (string dir in dirs)
-				{
-					if (	dir.EndsWith("blue") &&
-						(	dir.Contains("054C:05C4") ||
-							dir.Contains("054C:09CC")	)	)
-					{
-						ledList.Add(dir.Substring(0, dir.LastIndexOf(':') + 1));
-					}
-				}
-				// Find how many of these are already in use
-				int numLights = 0;
-				for (int i = 0; i < INTERNAL_lightBars.Length; i += 1)
-				{
-					if (!String.IsNullOrEmpty(INTERNAL_lightBars[i]))
-					{
-						numLights += 1;
-					}
-				}
-				// If all are not already in use, use the first unused light
-				if (numLights < ledList.Count)
-				{
-					INTERNAL_lightBars[which] = ledList[numLights];
-				}
 			}
 
 			// Print controller information to stdout.
@@ -1929,31 +2129,6 @@ namespace Microsoft.Xna.Framework
 			SDL.SDL_ClearError();
 
 			FNALoggerEXT.LogInfo("Removed device, player: " + output.ToString());
-		}
-
-		// GetState can convert stick values to button values
-		private static Buttons READ_StickToButtons(Vector2 stick, Buttons left, Buttons right, Buttons up , Buttons down, float DeadZoneSize)
-		{
-			Buttons b = (Buttons) 0;
-
-			if (stick.X > DeadZoneSize)
-			{
-				b |= right;
-			}
-			if (stick.X < -DeadZoneSize)
-			{
-				b |= left;
-			}
-			if (stick.Y > DeadZoneSize)
-			{
-				b |= up;
-			}
-			if (stick.Y < -DeadZoneSize)
-			{
-				b |= down;
-			}
-
-			return b;
 		}
 
 		private static string[] GenStringArray()
@@ -2122,8 +2297,9 @@ namespace Microsoft.Xna.Framework
 			{ (int) SDL.SDL_Keycode.SDLK_LSHIFT,		Keys.LeftShift },
 			{ (int) SDL.SDL_Keycode.SDLK_RSHIFT,		Keys.RightShift },
 			{ (int) SDL.SDL_Keycode.SDLK_APPLICATION,	Keys.Apps },
+			{ (int) SDL.SDL_Keycode.SDLK_MENU,		Keys.Apps },
 			{ (int) SDL.SDL_Keycode.SDLK_SLASH,		Keys.OemQuestion },
-			{ (int) SDL.SDL_Keycode.SDLK_BACKSLASH,		Keys.OemBackslash },
+			{ (int) SDL.SDL_Keycode.SDLK_BACKSLASH,		Keys.OemPipe },
 			{ (int) SDL.SDL_Keycode.SDLK_LEFTBRACKET,	Keys.OemOpenBrackets },
 			{ (int) SDL.SDL_Keycode.SDLK_RIGHTBRACKET,	Keys.OemCloseBrackets },
 			{ (int) SDL.SDL_Keycode.SDLK_CAPSLOCK,		Keys.CapsLock },
@@ -2253,8 +2429,9 @@ namespace Microsoft.Xna.Framework
 			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_LSHIFT,		Keys.LeftShift },
 			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_RSHIFT,		Keys.RightShift },
 			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_APPLICATION,	Keys.Apps },
+			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_MENU,		Keys.Apps },
 			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_SLASH,		Keys.OemQuestion },
-			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_BACKSLASH,	Keys.OemBackslash },
+			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_BACKSLASH,	Keys.OemPipe },
 			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_LEFTBRACKET,	Keys.OemOpenBrackets },
 			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_RIGHTBRACKET,	Keys.OemCloseBrackets },
 			{ (int) SDL.SDL_Scancode.SDL_SCANCODE_CAPSLOCK,		Keys.CapsLock },
@@ -2380,7 +2557,7 @@ namespace Microsoft.Xna.Framework
 			{ (int) Keys.RightShift,	SDL.SDL_Scancode.SDL_SCANCODE_RSHIFT },
 			{ (int) Keys.Apps,		SDL.SDL_Scancode.SDL_SCANCODE_APPLICATION },
 			{ (int) Keys.OemQuestion,	SDL.SDL_Scancode.SDL_SCANCODE_SLASH },
-			{ (int) Keys.OemBackslash,	SDL.SDL_Scancode.SDL_SCANCODE_BACKSLASH },
+			{ (int) Keys.OemPipe,		SDL.SDL_Scancode.SDL_SCANCODE_BACKSLASH },
 			{ (int) Keys.OemOpenBrackets,	SDL.SDL_Scancode.SDL_SCANCODE_LEFTBRACKET },
 			{ (int) Keys.OemCloseBrackets,	SDL.SDL_Scancode.SDL_SCANCODE_RIGHTBRACKET },
 			{ (int) Keys.CapsLock,		SDL.SDL_Scancode.SDL_SCANCODE_CAPSLOCK },
@@ -2471,7 +2648,8 @@ namespace Microsoft.Xna.Framework
 		#region Private Static Win32 WM_PAINT Interop
 
 		private static SDL.SDL_EventFilter win32OnPaint = Win32OnPaint;
-		private static unsafe int Win32OnPaint(IntPtr func, IntPtr evtPtr)
+		private static SDL.SDL_EventFilter prevEventFilter;
+		private static unsafe int Win32OnPaint(IntPtr userdata, IntPtr evtPtr)
 		{
 			SDL.SDL_Event* evt = (SDL.SDL_Event*) evtPtr;
 			if (	evt->type == SDL.SDL_EventType.SDL_WINDOWEVENT &&
@@ -2486,6 +2664,10 @@ namespace Microsoft.Xna.Framework
 						return 0;
 					}
 				}
+			}
+			if (prevEventFilter != null)
+			{
+				return prevEventFilter(userdata, evtPtr);
 			}
 			return 1;
 		}

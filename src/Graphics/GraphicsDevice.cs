@@ -1,6 +1,6 @@
 #region License
 /* FNA - XNA4 Reimplementation for Desktop Platforms
- * Copyright 2009-2020 Ethan Lee and the MonoGame Team
+ * Copyright 2009-2021 Ethan Lee and the MonoGame Team
  *
  * Released under the Microsoft Public License.
  * See LICENSE for details.
@@ -305,14 +305,16 @@ namespace Microsoft.Xna.Framework.Graphics
 
 		#region Private RenderTarget Variables
 
-		private readonly RenderTargetBinding[] renderTargetBindings =
+		// Some of these are internal for validation purposes
+
+		internal readonly RenderTargetBinding[] renderTargetBindings =
 			new RenderTargetBinding[MAX_RENDERTARGET_BINDINGS];
 		private FNA3D.FNA3D_RenderTargetBinding[] nativeTargetBindings =
 			new FNA3D.FNA3D_RenderTargetBinding[MAX_RENDERTARGET_BINDINGS];
 		private FNA3D.FNA3D_RenderTargetBinding[] nativeTargetBindingsNext =
 			new FNA3D.FNA3D_RenderTargetBinding[MAX_RENDERTARGET_BINDINGS];
 
-		private int renderTargetCount = 0;
+		internal int renderTargetCount = 0;
 
 		// Used to prevent allocs on SetRenderTarget()
 		private readonly RenderTargetBinding[] singleTargetCache = new RenderTargetBinding[1];
@@ -366,7 +368,7 @@ namespace Microsoft.Xna.Framework.Graphics
 
 		#endregion
 
-		#region Constructor, Deconstructor, Dispose Methods
+		#region Constructor, Destructor, Dispose Methods
 
 		/// <summary>
 		/// Initializes a new instance of the <see cref="GraphicsDevice" /> class.
@@ -850,6 +852,12 @@ namespace Microsoft.Xna.Framework.Graphics
 
 		public void SetRenderTargets(params RenderTargetBinding[] renderTargets)
 		{
+			// D3D11 requires our sampler state to be valid (i.e. not point to any of our new RTs)
+			//  before we call SetRenderTargets. At this point FNA3D does not have a current copy
+			//  of the managed sampler state, so we need to apply our current state now instead of
+			//  before our next Clear or Draw operation.
+			ApplySamplers();
+
 			// Checking for redundant SetRenderTargets...
 			if (renderTargets == null && renderTargetCount == 0)
 			{
@@ -884,7 +892,7 @@ namespace Microsoft.Xna.Framework.Graphics
 					0,
 					IntPtr.Zero,
 					DepthFormat.None,
-					0
+					(byte) (PresentationParameters.RenderTargetUsage != RenderTargetUsage.DiscardContents ? 1 : 0) /* lol c# */
 				);
 
 				// Set the viewport/scissor to the size of the backbuffer.
@@ -1477,6 +1485,11 @@ namespace Microsoft.Xna.Framework.Graphics
 				ref RasterizerState.state
 			);
 
+			ApplySamplers();
+		}
+
+		private void ApplySamplers()
+		{
 			for (int sampler = 0; sampler < modifiedSamplers.Length; sampler += 1)
 			{
 				if (!modifiedSamplers[sampler])
